@@ -10725,6 +10725,110 @@ fn url_hash_mismatch() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn concurrent_url_source_locks_leave_a_usable_cache() -> Result<()> {
+    use std::time::Duration;
+
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    let context1 = uv_test::test_context!("3.12");
+    let context2 = uv_test::test_context!("3.12");
+    let context3 = uv_test::test_context!("3.12");
+
+    let server = MockServer::start().await;
+    let archive_path = context1
+        .workspace_root
+        .join("test/links/tqdm-999.0.0.tar.gz");
+    let archive_bytes = fs_err::read(&archive_path)?;
+    let archive_url = format!("{}/files/tqdm-999.0.0.tar.gz", server.uri());
+    let shared_cache = context1.temp_dir.child("shared-cache");
+    fs_err::create_dir_all(shared_cache.path())?;
+
+    Mock::given(method("GET"))
+        .and(path("/files/tqdm-999.0.0.tar.gz"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(1))
+                .set_body_bytes(archive_bytes),
+        )
+        .mount(&server)
+        .await;
+
+    let write_pyproject = |context: &TestContext| -> Result<()> {
+        context
+            .temp_dir
+            .child("pyproject.toml")
+            .write_str(&formatdoc! { r#"
+            [project]
+            name = "project"
+            version = "0.1.0"
+            requires-python = ">=3.12"
+            dependencies = ["tqdm @ {archive_url}"]
+            "#,
+            })?;
+        Ok(())
+    };
+
+    write_pyproject(&context1)?;
+    write_pyproject(&context2)?;
+    write_pyproject(&context3)?;
+
+    let lock_command = |context: &TestContext| {
+        let mut command = std::process::Command::new(uv_test::get_bin!());
+        command
+            .arg("lock")
+            .arg("--cache-dir")
+            .arg(shared_cache.path())
+            .current_dir(context.temp_dir.path());
+        context.add_shared_env(&mut command, false);
+        command
+    };
+
+    let child1 = lock_command(&context1).spawn()?;
+    let child2 = lock_command(&context2).spawn()?;
+
+    let output1 = child1.wait_with_output()?;
+    let output2 = child2.wait_with_output()?;
+
+    assert!(
+        output1.status.success(),
+        "first `uv lock` failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output1.stdout),
+        String::from_utf8_lossy(&output1.stderr),
+    );
+    assert!(
+        output2.status.success(),
+        "second `uv lock` failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output2.stdout),
+        String::from_utf8_lossy(&output2.stderr),
+    );
+
+    let archive_requests = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/files/tqdm-999.0.0.tar.gz")
+        .count();
+    assert!(
+        archive_requests >= 2,
+        "expected at least two archive requests, saw {archive_requests}"
+    );
+
+    let offline_output = lock_command(&context3).arg("--offline").output()?;
+    assert!(
+        offline_output.status.success(),
+        "offline `uv lock` failed after concurrent cache writes\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&offline_output.stdout),
+        String::from_utf8_lossy(&offline_output.stderr),
+    );
+
+    Ok(())
+}
+
 #[test]
 fn path_hash_mismatch() -> Result<()> {
     let context = uv_test::test_context!("3.12");
